@@ -248,3 +248,246 @@ class VaceWanModel(WanModel):
         # unpatchify
         x = self.unpatchify(x, grid_sizes)
         return [u.float() for u in x]
+
+#=======================流式加载版本 v0.5，模型和流加载解耦合============
+# stream_offload.py
+# from __future__ import annotations
+import torch, weakref
+from typing import Dict, List, Sequence, Tuple
+
+class OffloadManager:
+    """
+    Generic streaming-weight offloader.
+    Example
+    -------
+    model = VaceWanModel(...)
+    offloader = OffloadManager(
+        model,
+        module_groups={
+            "blocks": model.blocks,
+            "vace_blocks": model.vace_blocks,
+        },
+        keep_n={"blocks": 10, "vace_blocks": 10},
+    )
+    offloader.enable()      # 推理
+    ...
+    offloader.disable()     # 结束
+    """
+
+    def __init__(
+        self,
+        root: torch.nn.Module,
+        module_groups: Dict[str, Sequence[torch.nn.Module]],
+        keep_n: Dict[str, int] | int,
+        device: torch.device | None = None,
+    ):
+        self.root        = weakref.proxy(root)   # 不与模型相互引用
+        self.device      = device or next(root.parameters()).device
+        self.keep_n      = (
+            {k: keep_n for k in module_groups} if isinstance(keep_n, int) else keep_n
+        )
+        self.groups      = module_groups
+
+        self.h2d_stream  = torch.cuda.Stream()
+        self.d2h_stream  = torch.cuda.Stream()
+        self.enabled     = False
+        self.handles: List[torch.utils.hooks.RemovableHandle] = []
+
+        # 保证每层都有 index/depth 属性（如果模型没设）
+        for name, grp in self.groups.items():
+            for i, m in enumerate(grp):
+                if not hasattr(m, "index"):
+                    m.index = i
+                if not hasattr(m, "depth"):
+                    m.depth = len(grp)
+
+    def enable(self):
+        """
+        打开流式权重加载 / 推理 offload。
+        逻辑顺序：
+            0) 先把“常驻层”(前 keep_n) 全量搬到目标 GPU
+            1) 针对其余层执行 CPU-offload（复制到 pinned-CPU 并释放 GPU）
+            2) 注册前向 pre / post hooks
+        """
+        if self.enabled:                       # 已开启则直接返回
+            return
+
+        if not torch.cuda.is_available():
+            raise RuntimeError("CUDA required for streaming-offload.")
+
+        # --------------------------------------------------
+        # 0️⃣  确保前 keep_n 层全部在 self.device
+        # --------------------------------------------------
+        for tag, grp in self.groups.items():
+            stay_on_gpu = min(self.keep_n[tag], len(grp))
+            for i in range(stay_on_gpu):
+                grp[i].to(self.device, non_blocking=False)
+
+        # --------------------------------------------------
+        # 1️⃣  对 keep_n 之后的层做 offload
+        # --------------------------------------------------
+        for tag, grp in self.groups.items():
+            if len(grp) > self.keep_n[tag]:
+                self._setup_parameter_offload(grp, self.keep_n[tag])
+
+        # --------------------------------------------------
+        # 2️⃣  注册 hooks：预取 + 释放
+        # --------------------------------------------------
+        for tag, grp in self.groups.items():
+            for m in grp:
+                # forward 之前预取下一层
+                pre_h = m.register_forward_pre_hook(
+                    self._prefetch_hook_factory(tag), with_kwargs=False
+                )
+                self.handles.append(pre_h)
+
+                # forward 结束后释放自己（仅超出 keep_n 的层）
+                if m.index >= self.keep_n[tag]:
+                    post_h = m.register_forward_hook(
+                        self._release_hook_factory(tag), with_kwargs=False
+                    )
+                    self.handles.append(post_h)
+
+        # --------------------------------------------------
+        # ✅  启动后做一次快速校验
+        # --------------------------------------------------
+        for tag, grp in self.groups.items():
+            for i in range(min(self.keep_n[tag], len(grp))):
+                p_dev = next(grp[i].parameters()).device
+                assert p_dev == self.device, (
+                    f"{tag}[{i}] still on {p_dev}, expect {self.device}"
+                )
+
+        self.enabled = True
+        print(f"[offload] enabled on {list(self.groups)} "
+            f"(keep_n={self.keep_n}, device={self.device})")
+
+
+    def disable(self):
+        if not self.enabled:
+            return
+        self._restore_all()
+        self._remove_hooks()
+        self.enabled = False
+        print("[offload] disabled – all weights back on GPU")
+
+    # ---------- internal ----------
+    # a. 迭代张量
+    @staticmethod
+    def _iter_tensors(m: torch.nn.Module):
+        yield from m.parameters(recurse=True)
+        yield from m.buffers(recurse=True)
+
+    # b. 预取 hook
+    def _prefetch_hook_factory(self, tag: str):
+        keep_n = self.keep_n[tag]
+        grp    = self.groups[tag]
+
+        def hook(module, _inputs):
+            if module.index + keep_n >= len(grp):
+                return                      # 最后几层无需预取
+
+            nxt = grp[module.index + keep_n]
+            evt = torch.cuda.Event(); evt.record()
+
+            with torch.cuda.stream(self.h2d_stream):
+                self.h2d_stream.wait_event(evt)
+                for p in self._iter_tensors(nxt):
+                    self._ensure_gpu_tensor(p)
+            torch.cuda.current_stream().wait_stream(self.h2d_stream)
+        return hook
+
+    # c. 释放 hook
+    def _release_hook_factory(self, tag: str):
+        keep_n = self.keep_n[tag]
+
+        def hook(module, _inp, _out):
+            if module.index < keep_n:
+                return
+            for p in self._iter_tensors(module):
+                self._release_tensor(p)
+        return hook
+
+    # d. CPU offload upfront
+    def _setup_parameter_offload(self, grp, keep_n):
+        for idx in range(keep_n, len(grp)):
+            blk = grp[idx]
+            with torch.cuda.stream(self.d2h_stream):
+                for p in self._iter_tensors(blk):
+                    if not hasattr(p, "p_cpu"):
+                        p.p_cpu = torch.empty_like(p.data, pin_memory=True, device="cpu")
+                    p.p_cpu.copy_(p.data, non_blocking=True)
+        torch.cuda.current_stream().wait_stream(self.d2h_stream)
+        for idx in range(keep_n, len(grp)):
+            blk = grp[idx]
+            for p in self._iter_tensors(blk):
+                self._release_tensor(p)
+
+    # e. helpers
+    def _ensure_gpu_tensor(self, p: torch.Tensor):
+        """
+        确保张量 p 位于 self.device 并具有正确 shape / storage。
+        若 p 被释放过（storage==0）或大小不足，重新分配；随后把
+        备份的 p_cpu 数据复制到 GPU 张量。
+        """
+        dev = self.device
+
+        # ① 判断是否需要重新分配
+        need_alloc = (
+            p.data.device != dev or                           # 不在目标 GPU
+            p.data.untyped_storage().size() == 0 or           # storage 已清零
+            p.data.untyped_storage().size() <
+            getattr(p, "storage_size", p.numel())             # storage 太小
+        )
+
+        if need_alloc:
+            # 取原始形状（在 _setup_parameter_offload() 中记录）
+            target_shape = getattr(p, "orig_shape", tuple(
+                p.p_cpu.shape if hasattr(p, "p_cpu") else p.shape)
+            )
+            # 重新分配 GPU 张量
+            p.data = torch.empty(target_shape, dtype=p.dtype, device=dev)
+
+        # ② 把备份数据同步到 GPU
+        if hasattr(p, "p_cpu"):
+            if getattr(p, "is_slice_tensor", False):
+                p.data.copy_(p.p_cpu, non_blocking=True)
+            else:
+                p.data.untyped_storage().copy_(
+                    p.p_cpu.untyped_storage(), non_blocking=True
+                )
+        else:
+            # 首次出现 / buffer：只需保证在 GPU
+            if need_alloc or p.data.device != dev:
+                p.data = p.data.to(dev, non_blocking=True)
+
+        # ③ 清除 “已释放” 标记
+        if getattr(p, "_released", False):
+            p._released = False
+
+    @staticmethod
+    def _release_tensor(p: torch.Tensor):
+        try:    # view 友好
+            p.data.untyped_storage().resize_(0)
+            p.data.resize_(0)
+        except RuntimeError:
+            p.data = torch.empty(0, dtype=p.dtype, device=p.device)
+
+    def _restore_all(self):
+        for grp in self.groups.values():
+            for m in grp:
+                for p in self._iter_tensors(m):
+                    if p.data.untyped_storage().size() == 0:
+                        target = torch.empty(p.orig_shape, dtype=p.dtype, device=self.device)
+                        target.copy_(p.p_cpu, non_blocking=False)
+                        p.data = target
+                    elif p.data.device != self.device:
+                        p.data = p.data.to(self.device, non_blocking=False)
+
+    def _remove_hooks(self):
+        for h in self.handles:
+            h.remove()
+        self.handles.clear()
+
+
+
