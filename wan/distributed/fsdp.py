@@ -19,12 +19,14 @@ def shard_model(
     sharding_strategy=ShardingStrategy.FULL_SHARD,
     sync_module_states=True,
 ):
+    def block_with_params_policy(module, recurse, unwrapped_params):
+        return (module in model.blocks) and any(p.numel() > 0 for p in module.parameters(recurse=False))
+
     model = FSDP(
         module=model,
         process_group=process_group,
         sharding_strategy=sharding_strategy,
-        auto_wrap_policy=partial(
-            lambda_auto_wrap_policy, lambda_fn=lambda m: m in model.blocks),
+        auto_wrap_policy=block_with_params_policy,
         mixed_precision=MixedPrecision(
             param_dtype=param_dtype,
             reduce_dtype=reduce_dtype,

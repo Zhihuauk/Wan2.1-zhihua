@@ -626,6 +626,8 @@ class WanVaceMP(WanVace):
             model = VaceWanModel.from_pretrained(self.checkpoint_dir)
             
             # model = FSDP(model)
+            
+            model.eval().requires_grad_(False)
             offloader = OffloadManager(
                 model,
                 module_groups={"blocks": model.module.blocks, "vace_blocks": model.module.vace_blocks},
@@ -634,9 +636,7 @@ class WanVaceMP(WanVace):
                 distributed=True
             )
             offloader.enable()
-
-
-            model.eval().requires_grad_(False)
+            
 
             if self.use_usp:
                 from xfuser.core.distributed import get_sequence_parallel_world_size
