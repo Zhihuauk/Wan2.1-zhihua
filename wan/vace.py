@@ -32,8 +32,9 @@ from .text2video import (
     shard_model,
 )
 from .utils.vace_processor import VaceVideoProcessor
-from .modules.stream_offload import OffloadManager
 
+from wan.modules.stream_offload import OffloadManager          # 旧单卡
+from wan.modules.stream_offload_fsdp import enable_fsdp_stream_offload  # <‑‑ 新增
 
 class WanVace(WanT2V):
 
@@ -96,22 +97,22 @@ class WanVace(WanT2V):
         self.model = VaceWanModel.from_pretrained(checkpoint_dir)
         self.model.eval().requires_grad_(False)
 
-        device = self.device            # e.g. torch.device("cuda", 0)
-        # 1. 先把“非流式”模块搬到 GPU 并 half
-        for name in ["patch_embedding", "time_embedding", "text_embedding",
-                    "vace_patch_embedding", "time_projection", "head"]:
-            setattr(self.model, name, getattr(self.model, name).to(device).half())
+        # device = self.device            # e.g. torch.device("cuda", 0)
+        # # 1. 先把“非流式”模块搬到 GPU 并 half
+        # for name in ["patch_embedding", "time_embedding", "text_embedding",
+        #             "vace_patch_embedding", "time_projection", "head"]:
+        #     setattr(self.model, name, getattr(self.model, name).to(device).half())
 
-        # 2. 构造并保存 OffloadManager
-        self.offloader = OffloadManager(
-            self.model,
-            module_groups={"blocks": self.model.blocks,
-                        "vace_blocks": self.model.vace_blocks},
-            keep_n={"blocks": 1, "vace_blocks": 1},
-            device=self.device,              # ★ 显式指定
-            distributed=False
-        )
-        self.offloader.enable()         # 开启流式权重
+        # # 2. 构造并保存 OffloadManager
+        # self.offloader = OffloadManager(
+        #     self.model,
+        #     module_groups={"blocks": self.model.blocks,
+        #                 "vace_blocks": self.model.vace_blocks},
+        #     keep_n={"blocks": 1, "vace_blocks": 1},
+        #     device=self.device,              # ★ 显式指定
+        #     distributed=False
+        # )
+        # self.offloader.enable()         # 开启流式权重
 
         if use_usp:
             from xfuser.core.distributed import get_sequence_parallel_world_size
@@ -140,6 +141,28 @@ class WanVace(WanT2V):
             self.model = shard_fn(self.model)
         else:
             self.model.to(self.device)
+        
+        # =================fsdp hook  model ==================
+        self._offloader = None 
+        if dist.is_initialized() and dit_fsdp:
+        # FSDP + OffloadManager
+            self._offloader = enable_fsdp_stream_offload(
+                self.model,
+                keep_n=1,                 # 可调
+                device=self.device,
+            )
+        else:
+            # 原单卡流式分配
+            offloader = OffloadManager(
+                self.model,
+                module_groups={"blocks": self.model.blocks, "vace_blocks": self.model.vace_blocks},
+                keep_n=1,
+                device=self.device,
+            )
+        offloader.enable()
+        self._offloader = offloader
+        # =================fsdp hook  model ==================
+        
 
         self.sample_neg_prompt = config.sample_neg_prompt
 
@@ -624,19 +647,7 @@ class WanVaceMP(WanVace):
                 device=gpu)
             logging.info(f"Creating VaceWanModel from {self.checkpoint_dir}")
             model = VaceWanModel.from_pretrained(self.checkpoint_dir)
-            
-            # model = FSDP(model)
-            
             model.eval().requires_grad_(False)
-            offloader = OffloadManager(
-                model,
-                module_groups={"blocks": model.module.blocks, "vace_blocks": model.module.vace_blocks},
-                keep_n={"blocks": 1, "vace_blocks": 1},
-                device=torch.device(gpu),
-                distributed=True
-            )
-            offloader.enable()
-            
 
             if self.use_usp:
                 from xfuser.core.distributed import get_sequence_parallel_world_size
