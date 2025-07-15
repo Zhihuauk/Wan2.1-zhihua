@@ -19,7 +19,7 @@ def shard_model(
     sharding_strategy=ShardingStrategy.FULL_SHARD,
     sync_module_states=True,
 ):
-    def block_with_params_policy(module, recurse, unwrapped_params):
+    def block_with_params_policy(module, recurse, nonwrapped_numel):
         return (module in model.blocks) and any(p.numel() > 0 for p in module.parameters(recurse=False))
 
     model = FSDP(
