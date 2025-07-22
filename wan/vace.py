@@ -10,6 +10,7 @@ import traceback
 import types
 from contextlib import contextmanager
 from functools import partial
+from typing import Dict
 
 import torch
 import torch.cuda.amp as amp
@@ -20,6 +21,7 @@ import torchvision.transforms.functional as TF
 from PIL import Image
 from tqdm import tqdm
 
+from .modules.stream_offload import OffloadManager
 from .modules.vace_model import VaceWanModel
 from .text2video import (
     FlowDPMSolverMultistepScheduler,
@@ -46,6 +48,9 @@ class WanVace(WanT2V):
         dit_fsdp=False,
         use_usp=False,
         t5_cpu=False,
+        enable_offload=False,
+        blocks_resident_count=2,
+        vace_blocks_resident_count=2,
     ):
         r"""
         Initializes the Wan text-to-video generation model components.
@@ -67,6 +72,12 @@ class WanVace(WanT2V):
                 Enable distribution strategy of USP.
             t5_cpu (`bool`, *optional*, defaults to False):
                 Whether to place T5 model on CPU. Only works without t5_fsdp.
+            enable_offload (`bool`, *optional*, defaults to False):
+                Enable streaming offload for model parameters to save GPU memory.
+            blocks_resident_count (`int`, *optional*, defaults to 2):
+                Number of main blocks to keep resident on GPU when offload is enabled.
+            vace_blocks_resident_count (`int`, *optional*, defaults to 2):
+                Number of vace blocks to keep resident on GPU when offload is enabled.
         """
         self.device = torch.device(f"cuda:{device_id}")
         self.config = config
@@ -135,6 +146,30 @@ class WanVace(WanT2V):
             zero_start=True,
             seq_len=75600,
             keep_last=True)
+
+        # Initialize streaming offload if enabled
+        self.offload_manager = None
+        if enable_offload:
+            self.offload_manager = OffloadManager(device_id=device_id)
+            
+            # Register both block types for offload management
+            self.offload_manager.register_modules(
+                module_name='blocks',
+                modules=self.model.blocks,
+                resident_count=blocks_resident_count
+            )
+            
+            self.offload_manager.register_modules(
+                module_name='vace_blocks', 
+                modules=self.model.vace_blocks,
+                resident_count=vace_blocks_resident_count
+            )
+            
+            # Enable offload after all modules are registered
+            self.offload_manager.enable_offload()
+            
+            logging.info(f"Streaming offload enabled with {blocks_resident_count} main blocks "
+                        f"and {vace_blocks_resident_count} vace blocks resident on GPU")
 
     def vace_encode_frames(self, frames, ref_images, masks=None, vae=None):
         vae = self.vae if vae is None else vae
@@ -474,6 +509,37 @@ class WanVace(WanT2V):
 
         return videos[0] if self.rank == 0 else None
 
+    def get_offload_memory_stats(self):
+        """
+        Get memory statistics for offloaded modules.
+        
+        Returns:
+            Dict: Memory statistics for each module type, or None if offload is disabled.
+        """
+        if self.offload_manager is not None:
+            return self.offload_manager.get_memory_stats()
+        return None
+
+    def disable_offload(self):
+        """
+        Disable streaming offload and restore all parameters to GPU.
+        """
+        if self.offload_manager is not None:
+            self.offload_manager.disable_offload()
+            self.offload_manager = None
+            logging.info("Streaming offload disabled for WanVace model")
+        else:
+            logging.warning("Offload is not enabled, nothing to disable")
+
+    def is_offload_enabled(self) -> bool:
+        """
+        Check if streaming offload is currently enabled.
+        
+        Returns:
+            bool: True if offload is enabled, False otherwise.
+        """
+        return self.offload_manager is not None and self.offload_manager._initialized
+
 
 class WanVaceMP(WanVace):
 
@@ -482,10 +548,16 @@ class WanVaceMP(WanVace):
                  checkpoint_dir,
                  use_usp=False,
                  ulysses_size=None,
-                 ring_size=None):
+                 ring_size=None,
+                 enable_offload=False,
+                 blocks_resident_count=2,
+                 vace_blocks_resident_count=2):
         self.config = config
         self.checkpoint_dir = checkpoint_dir
         self.use_usp = use_usp
+        self.enable_offload = enable_offload
+        self.blocks_resident_count = blocks_resident_count
+        self.vace_blocks_resident_count = vace_blocks_resident_count
         os.environ['MASTER_ADDR'] = 'localhost'
         os.environ['MASTER_PORT'] = '12345'
         os.environ['RANK'] = '0'
@@ -631,6 +703,32 @@ class WanVaceMP(WanVace):
 
             dist.barrier()
             model = shard_fn(model)
+            
+            # Initialize streaming offload for worker if enabled
+            offload_manager = None
+            if self.enable_offload:
+                offload_manager = OffloadManager(device_id=gpu)
+                
+                # Register both block types for offload management
+                offload_manager.register_modules(
+                    module_name='blocks',
+                    modules=model.blocks,
+                    resident_count=self.blocks_resident_count
+                )
+                
+                offload_manager.register_modules(
+                    module_name='vace_blocks', 
+                    modules=model.vace_blocks,
+                    resident_count=self.vace_blocks_resident_count
+                )
+                
+                # Enable offload after all modules are registered
+                offload_manager.enable_offload()
+                
+                logging.info(f"MP Worker {gpu}: Streaming offload enabled with "
+                            f"{self.blocks_resident_count} main blocks and "
+                            f"{self.vace_blocks_resident_count} vace blocks resident")
+            
             sample_neg_prompt = self.config.sample_neg_prompt
 
             torch.cuda.empty_cache()
@@ -795,3 +893,27 @@ class WanVaceMP(WanVace):
         value_output = self.out_q.get()
 
         return value_output
+
+    def is_offload_enabled(self) -> bool:
+        """
+        Check if streaming offload is enabled for this multiprocessing instance.
+        
+        Note: This only reflects the configuration, not the actual worker processes.
+        
+        Returns:
+            bool: True if offload is configured to be enabled, False otherwise.
+        """
+        return self.enable_offload
+
+    def get_offload_config(self) -> Dict:
+        """
+        Get the offload configuration for this multiprocessing instance.
+        
+        Returns:
+            Dict: Offload configuration including resident counts for each module type.
+        """
+        return {
+            'enabled': self.enable_offload,
+            'blocks_resident_count': self.blocks_resident_count,
+            'vace_blocks_resident_count': self.vace_blocks_resident_count
+        }
