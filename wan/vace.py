@@ -97,22 +97,14 @@ class WanVace(WanT2V):
         self.model = VaceWanModel.from_pretrained(checkpoint_dir)
         self.model.eval().requires_grad_(False)
 
-        # device = self.device            # e.g. torch.device("cuda", 0)
-        # # 1. 先把“非流式”模块搬到 GPU 并 half
-        # for name in ["patch_embedding", "time_embedding", "text_embedding",
-        #             "vace_patch_embedding", "time_projection", "head"]:
-        #     setattr(self.model, name, getattr(self.model, name).to(device).half())
-
-        # # 2. 构造并保存 OffloadManager
-        # self.offloader = OffloadManager(
-        #     self.model,
-        #     module_groups={"blocks": self.model.blocks,
-        #                 "vace_blocks": self.model.vace_blocks},
-        #     keep_n={"blocks": 1, "vace_blocks": 1},
-        #     device=self.device,              # ★ 显式指定
-        #     distributed=False
-        # )
-        # self.offloader.enable()         # 开启流式权重
+        # =================准备非流式模块==================
+        device = self.device            # e.g. torch.device("cuda", 0)
+        
+        # 1. 先把"非流式"模块搬到 GPU 并 half（在FSDP包装之前）
+        for name in ["patch_embedding", "time_embedding", "text_embedding",
+                    "vace_patch_embedding", "time_projection", "head"]:
+            setattr(self.model, name, getattr(self.model, name).to(device).half())
+        # =================准备非流式模块==================
 
         if use_usp:
             from xfuser.core.distributed import get_sequence_parallel_world_size
@@ -142,27 +134,22 @@ class WanVace(WanT2V):
         else:
             self.model.to(self.device)
         
-        # =================fsdp hook  model ==================
-        self._offloader = None 
-        if dist.is_initialized() and dit_fsdp:
-        # FSDP + OffloadManager
-            self._offloader = enable_fsdp_stream_offload(
-                self.model,
-                keep_n=1,                 # 可调
-                device=self.device,
-            )
-        else:
-            # 原单卡流式分配
-            offloader = OffloadManager(
-                self.model,
-                module_groups={"blocks": self.model.blocks, "vace_blocks": self.model.vace_blocks},
-                keep_n=1,
-                device=self.device,
-            )
-        offloader.enable()
-        self._offloader = offloader
-        # =================fsdp hook  model ==================
+        # =================stream offload setup ==================
+        # 现在model已经被FSDP包装（如果需要的话），可以正确检测FSDP状态
+        is_using_fsdp = dit_fsdp and dist.is_initialized()
         
+        # 构造并保存 OffloadManager（改进：在FSDP包装后进行）
+        # 注意：根据fsdp.py的配置，只有model.blocks会被FSDP包装，vace_blocks不会
+        self.offloader = OffloadManager(
+            self.model,
+            module_groups={"blocks": self.model.blocks,
+                        "vace_blocks": self.model.vace_blocks},
+            keep_n={"blocks": 1, "vace_blocks": 1},
+            device=self.device,              # ★ 显式指定
+            distributed=is_using_fsdp        # ★ 根据FSDP状态动态设置
+        )
+        self.offloader.enable()         # 开启流式权重
+        # =================stream offload setup ==================
 
         self.sample_neg_prompt = config.sample_neg_prompt
 
@@ -514,6 +501,117 @@ class WanVace(WanT2V):
             dist.barrier()
 
         return videos[0] if self.rank == 0 else None
+
+    # ============== Stream Offload API 方法 ==============
+    
+    def enable_offload(self, keep_n: int = None):
+        """
+        启用流式权重offload来节省GPU内存。
+        
+        Args:
+            keep_n: 保留在GPU上的blocks数量。如果为None，使用当前配置。
+        """
+        if self.offloader is None:
+            logging.warning("Offloader not initialized")
+            return
+            
+        if keep_n is not None:
+            self.offloader.set_keep_n(keep_n)
+            
+        if not self.offloader.is_enabled():
+            self.offloader.enable()
+            self._offload_enabled = True
+            logging.info("Stream offload enabled")
+        else:
+            logging.warning("Stream offload already enabled")
+    
+    def disable_offload(self):
+        """禁用流式权重offload，将所有参数恢复到GPU。"""
+        if self.offloader is None:
+            logging.warning("Offloader not initialized")
+            return
+            
+        if self.offloader.is_enabled():
+            self.offloader.disable()
+            self._offload_enabled = False
+            logging.info("Stream offload disabled")
+        else:
+            logging.warning("Stream offload already disabled")
+    
+    def get_memory_stats(self):
+        """获取当前内存使用统计。"""
+        if self.offloader is None:
+            return {"error": "Offloader not initialized"}
+        return self.offloader.get_memory_stats()
+    
+    def get_offload_info(self):
+        """获取offload详细信息。"""
+        if self.offloader is None:
+            return {"error": "Offloader not initialized"}
+        
+        info = self.offloader.get_block_info()
+        info.update({
+            "enabled": self._offload_enabled,
+            "manager_type": "FSDP" if (hasattr(self.offloader, 'distributed') and self.offloader.distributed) else "Single-GPU"
+        })
+        return info
+    
+    def is_offload_enabled(self):
+        """检查offload是否当前已启用。"""
+        return self._offload_enabled and (self.offloader is not None and self.offloader.is_enabled())
+    
+    def set_offload_keep_n(self, keep_n: int, auto_restart: bool = True):
+        """
+        设置保留在GPU上的blocks数量。
+        
+        Args:
+            keep_n: 新的keep_n值
+            auto_restart: 如果offload已启用，是否自动重启以应用新设置
+        """
+        if self.offloader is None:
+            logging.warning("Offloader not initialized")
+            return
+            
+        was_enabled = self.is_offload_enabled()
+        
+        if auto_restart and was_enabled:
+            self.disable_offload()
+            
+        self.offloader.set_keep_n(keep_n)
+        
+        if auto_restart and was_enabled:
+            self.enable_offload()
+            
+        logging.info(f"Offload keep_n set to {keep_n}")
+    
+    # 上下文管理器支持
+    def offload_context(self, keep_n: int = None):
+        """
+        返回一个上下文管理器，自动启用/禁用offload。
+        
+        Args:
+            keep_n: 保留在GPU上的blocks数量
+            
+        Returns:
+            上下文管理器
+        """
+        class OffloadContext:
+            def __init__(self, vace_instance, keep_n):
+                self.vace = vace_instance
+                self.keep_n = keep_n
+                self.was_enabled = False
+                
+            def __enter__(self):
+                self.was_enabled = self.vace.is_offload_enabled()
+                if not self.was_enabled:
+                    self.vace.enable_offload(self.keep_n)
+                return self
+                
+            def __exit__(self, exc_type, exc_val, exc_tb):
+                if not self.was_enabled and self.vace.is_offload_enabled():
+                    self.vace.disable_offload()
+        
+        return OffloadContext(self, keep_n)
 
 
 class WanVaceMP(WanVace):

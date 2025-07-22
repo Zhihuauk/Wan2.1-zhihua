@@ -75,6 +75,7 @@ def enable_fsdp_stream_offload(
     *,
     keep_n: int = 1,
     device: torch.device | None = None,
+    auto_enable: bool = True,
 ) -> OffloadManager:
     """Attach **stream‑offload** hooks to an already FSDP‑wrapped *model*.
 
@@ -86,6 +87,8 @@ def enable_fsdp_stream_offload(
         Sliding‑window size in GPU layers; equivalent to OffloadManager.keep_n.
     device
         GPU device where the model shards live (defaults to current).
+    auto_enable
+        Whether to automatically enable offloading (default: True).
 
     Returns
     -------
@@ -106,6 +109,10 @@ def enable_fsdp_stream_offload(
         module_groups=module_groups,
         keep_n=keep_n,
         device=device,
+        distributed=True,  # 标记为分布式模式
     )
-    offloader.enable()
+    
+    if auto_enable:
+        offloader.enable()
+    
     return offloader
