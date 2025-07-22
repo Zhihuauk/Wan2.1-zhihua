@@ -97,14 +97,25 @@ class WanVace(WanT2V):
         self.model = VaceWanModel.from_pretrained(checkpoint_dir)
         self.model.eval().requires_grad_(False)
 
-        # =================准备非流式模块==================
+        # =================准备模型数据类型==================
         device = self.device            # e.g. torch.device("cuda", 0)
         
-        # 1. 先把"非流式"模块搬到 GPU 并 half（在FSDP包装之前）
-        for name in ["patch_embedding", "time_embedding", "text_embedding",
-                    "vace_patch_embedding", "time_projection", "head"]:
-            setattr(self.model, name, getattr(self.model, name).to(device).half())
-        # =================准备非流式模块==================
+        # 1. 先移动模型到CPU并统一数据类型（为FSDP准备）
+        # 这是为了避免FSDP的"Must flatten tensors with uniform dtype"错误
+        will_use_fsdp = dit_fsdp and dist.is_initialized()
+        
+        if will_use_fsdp:
+            # FSDP场景：将整个模型转换为与FSDP配置一致的数据类型
+            # FSDP默认使用bfloat16，我们需要确保模型数据类型与FSDP配置一致
+            target_dtype = self.config.param_dtype if hasattr(self.config, 'param_dtype') else torch.bfloat16
+            self.model = self.model.to(dtype=target_dtype)
+            print(f"[FSDP] Converted entire model to {target_dtype} for FSDP compatibility")
+        else:
+            # 单卡场景：只转换非流式模块并移动到GPU
+            for name in ["patch_embedding", "time_embedding", "text_embedding",
+                        "vace_patch_embedding", "time_projection", "head"]:
+                setattr(self.model, name, getattr(self.model, name).to(device).half())
+        # =================准备模型数据类型==================
 
         if use_usp:
             from xfuser.core.distributed import get_sequence_parallel_world_size
