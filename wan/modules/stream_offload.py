@@ -1,209 +1,364 @@
-import torch
+import logging
 import weakref
-from typing import Dict, Sequence, Optional
-# Utility functiopn to ensure that the module is FSDP or DDP
-def _is_fsdp(module):
+from typing import Dict, Sequence, List, Union, Optional
+
+import torch
+import torch.nn as nn
+
+# ==================== helpers ====================
+
+def _is_fsdp(module: nn.Module) -> bool:
+    """Return True if *module* is an FSDP wrapper."""
     try:
-        from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+        from torch.distributed.fsdp import FullyShardedDataParallel as FSDP  # noqa: autoimport
         return isinstance(module, FSDP)
     except ImportError:
         return False
 
-def _is_ddp(module):
+
+def _is_ddp(module: nn.Module) -> bool:
+    """Return True if *module* is a DDP wrapper."""
     try:
-        from torch.nn.parallel import DistributedDataParallel as DDP
+        from torch.nn.parallel import DistributedDataParallel as DDP  # noqa: autoimport
         return isinstance(module, DDP)
     except ImportError:
         return False
 
-class OffloadManager:
+
+def _iter_module_tensors(module: nn.Module):
+    """Yield all real memory–owning tensors (params + buffers) inside *module*.
+
+    For FSDP with ``use_orig_params=True`` we can access parameters directly.
+    For DDP we unwrap one level via ``module.module``.
     """
-    通用流式权重管理器，支持单卡和分布式（FSDP/DDP）推理。
+    if _is_fsdp(module):
+        yield from module.parameters(recurse=True)
+        yield from module.buffers(recurse=True)
+    elif _is_ddp(module):
+        yield from module.module.parameters(recurse=True)
+        yield from module.module.buffers(recurse=True)
+    else:
+        yield from module.parameters(recurse=True)
+        yield from module.buffers(recurse=True)
+
+
+# ==================== OffloadManager ====================
+
+class OffloadManager:
+    """Streaming weight off‑load manager.
+
+    The API is *compatible with the original single‑card version* while
+    internally adopting some of the clearer abstractions from the multi‑card
+    implementation.
+
+    Parameters
+    ----------
+    root : nn.Module
+        The root model (only kept as weakref to break reference cycles).
+    module_groups : Dict[str, Sequence[nn.Module]] | None
+        Mapping name → list of sequential sub‑modules (e.g. transformer blocks).
+        Can be omitted and later registered via :py:meth:`register_modules`.
+    keep_n : int | Dict[str, int]
+        How many leading blocks in each group should *stay* on GPU.
+        Int applies to all groups; dict allows per‑group config.
+    device : torch.device | None
+        Destination CUDA device. *None* → device of the first parameter.
+    distributed : bool
+        Flag to indicate FSDP/DDP environment (affects memory accounting but
+        does not change public API).
     """
 
     def __init__(
         self,
-        root: torch.nn.Module, 
-        module_groups: Dict[str, Sequence[torch.nn.Module]],
-        keep_n: Dict[str, int] | int,
+        root: nn.Module,
+        module_groups: Optional[Dict[str, Sequence[nn.Module]]] = None,
+        keep_n: Union[int, Dict[str, int]] = 2,
         device: Optional[torch.device] = None,
         distributed: bool = False,
-    ):
-        self.root = weakref.proxy(root) #weakref 避免循环引用
+    ) -> None:
+        # ── basic attrs ────────────────────────────────────────────────────
+        self.root = weakref.proxy(root)
         self.device = device or next(root.parameters()).device
-        self.keep_n = ( #构建一个 keep_n 字典
-            {k: keep_n for k in module_groups} if isinstance(keep_n, int) else keep_n)
-        
-        self.groups = module_groups #modules 的分组
-        self.distributed = distributed #处理分布式推理
+        self.distributed = distributed
+        self.enabled = False
 
-        self.h2d_stream = torch.cuda.Stream() #host to device stream
-        self.d2h_stream = torch.cuda.Stream() #device to host stream
-        self.enabled = False #是否启用流式 offload
-        self.handles = [] # hooks 列表，统一保存已注册 hook，便于关闭
+        # ── module registry ───────────────────────────────────────────────
+        self.groups: Dict[str, List[nn.Module]] = {}
+        if module_groups:
+            for name, modules in module_groups.items():
+                self.register_modules(name, modules, keep_n if isinstance(keep_n, int) else keep_n.get(name, 2))
 
-        # 递归注册 index/depth
-        for name, grp in self.groups.items():
-            for i, m in enumerate(grp):
-                setattr(m, "_stream_offload_index", i) #注册属性 第几层 _stream_offload_index
-                setattr(m, "_stream_offload_depth", len(grp)) #注册属性 多深 _stream_offload_depth
+        # keep_n becomes dict[str,int] after registration; temp store original
+        self._keep_n_default = keep_n
 
-    def enable(self):
+        # ── streams & hook handles ────────────────────────────────────────
+        self.h2d_stream: Optional[torch.cuda.Stream] = None
+        self.d2h_stream: Optional[torch.cuda.Stream] = None
+        self._handles: List[torch.utils.hooks.RemovableHandle] = []
+
+        # ── logger ────────────────────────────────────────────────────────
+        self.logger = logging.getLogger(__name__)
+
+    # ====================================================================
+    # public API
+    # ====================================================================
+
+    def register_modules(
+        self,
+        name: str,
+        modules: Sequence[nn.Module],
+        resident_count: int | None = None,
+    ) -> None:
+        """Register a *sequential* block list that will participate in off‑load."""
         if self.enabled:
+            raise RuntimeError("Cannot register new modules after enable(). Call disable() first.")
+        if name in self.groups:
+            raise ValueError(f"Duplicate module group name: {name!r}")
+        self.groups[name] = list(modules)
+        # init keep_n mapping
+        if not hasattr(self, "keep_n"):
+            # first registration → build keep_n dict later
+            pass
+        if isinstance(self._keep_n_default, int):
+            k = self._keep_n_default if resident_count is None else resident_count
+        else:
+            k = self._keep_n_default.get(name, resident_count or 2)
+        if not hasattr(self, "keep_n"):
+            self.keep_n: Dict[str, int] = {}
+        self.keep_n[name] = k
+        # annotate helpers
+        for i, m in enumerate(modules):
+            setattr(m, "_stream_offload_index", i)
+            setattr(m, "_stream_offload_depth", len(modules))
+            setattr(m, "_stream_offload_group", name)
+        self.logger.info(
+            "[stream_offload] registered group '%s': %d modules, keep_n=%d",
+            name, len(modules), k,
+        )
+
+    # --------------------------------------------------------------------
+    def enable(self) -> None:
+        """Activate streaming off‑load."""
+        if self.enabled:
+            self.logger.warning("stream_offload already enabled – skipping …")
             return
-        # no CUDA check
         if not torch.cuda.is_available():
-            raise RuntimeError("CUDA required for streaming-offload.")
+            raise RuntimeError("CUDA required for streaming‑offload.")
+        if not self.groups:
+            raise RuntimeError("No module_groups registered.")
 
-        # 0. 保证前 keep_n 层在 self.device
+        # create streams only now (lazy) to use current device context
+        self.h2d_stream = torch.cuda.Stream()
+        self.d2h_stream = torch.cuda.Stream()
+
+        # step‑0: ensure first *keep_n* blocks on GPU
         for tag, grp in self.groups.items():
-            stay_on_gpu = min(self.keep_n[tag], len(grp)) #取输入层数和组长度的最小值
-            for i in range(stay_on_gpu): #将前 stay_on_gpu 层移动到目标设备，gpu/npu
-                self._move_module_to_device(grp[i], self.device)
+            for idx in range(min(self.keep_n[tag], len(grp))):
+                self._move_module_to_device(grp[idx], self.device)
 
-        # 1. keep_n 之后的层做 offload
+        # step‑1: warm‑up off‑load non‑resident blocks
         for tag, grp in self.groups.items():
-            if len(grp) > self.keep_n[tag]: #  对于大雨 keep_n 的层，进行 offload
-                self._setup_parameter_offload(grp, self.keep_n[tag])
+            if len(grp) > self.keep_n[tag]:
+                self._initial_offload(grp, self.keep_n[tag])
 
-        # 2. 注册 hooks
-        for tag, grp in self.groups.items(): #遍历所有的 groups
-            for m in grp: #遍历所有的模块，并注册pre_hooks 和 post_hooks
-                pre_h = m.register_forward_pre_hook( #这里重点，每次forward 前，先将 keep_n 之后的层预加载到 GPU
-                    self._prefetch_hook_factory(tag), with_kwargs=False
-                )
-                self.handles.append(pre_h)
-                if getattr(m, "_stream_offload_index") >= self.keep_n[tag]: #keepn之外的层，需要每轮都释放
-                    post_h = m.register_forward_hook( #这个接口发生在，forward后，释放 keep_n 之前的层
-                        self._release_hook_factory(tag), with_kwargs=False
-                    )
-                    self.handles.append(post_h)
+        # step‑2: register pre/post hooks
+        for tag, grp in self.groups.items():
+            for m in grp:
+                pre = m.register_forward_pre_hook(self._prefetch_hook_factory(tag))
+                self._handles.append(pre)
+                if getattr(m, "_stream_offload_index") >= self.keep_n[tag]:
+                    pst = m.register_forward_hook(self._release_hook_factory(tag))
+                    self._handles.append(pst)
 
         self.enabled = True
-        #输出 offload 状态
-        print(f"[stream_offload] enabled (keep_n={self.keep_n}, device={self.device}, distributed={self.distributed})")
+        self.logger.info("[stream_offload] enabled on %s (groups=%d).", self.device, len(self.groups))
 
-    # 取消启用流式 offload
-    def disable(self):
+    # --------------------------------------------------------------------
+    def disable(self, restore: bool = True) -> None:
+        """Disable and (optionally) bring all parameters back to GPU."""
         if not self.enabled:
             return
-        self._restore_all()
-        self._remove_hooks()
+        # remove hooks
+        for h in self._handles:
+            h.remove()
+        self._handles.clear()
+        if restore:
+            self._restore_all()
         self.enabled = False
-        print("[stream_offload] disabled – all weights back on GPU")
+        self.logger.info("[stream_offload] disabled – all hooks cleared%s.", " and weights restored" if restore else "")
 
-    # --- internal ---
-    # 将模块移动到指定设备
-    def _move_module_to_device(self, module, device):
-        # FSDP/DDP wrapper下递归到实际层
-        if _is_fsdp(module) or _is_ddp(module):
-            self._move_module_to_device(module.module, device)
-        else:
-            module.to(device, non_blocking=False)
+    # alias for context manager compat with old API
+    __enter__ = lambda self: (self.enable() or self)
+    __exit__ = lambda self, *exc: self.disable()
 
-    @staticmethod
-    #遍历一个 Module 内“真正占显存的张量
-    def _iter_tensors(m: torch.nn.Module):
-        yield from m.parameters(recurse=True)
-        yield from m.buffers(recurse=True)
+    # ====================================================================
+    # internals – off‑load mechanics
+    # ====================================================================
 
+    def _initial_offload(self, grp: Sequence[nn.Module], keep_n: int):
+        """Copy parameters of blocks >= *keep_n* to CPU‑pinned memory and free GPU."""
+        assert self.d2h_stream is not None  # created in enable()
+        for blk in grp[keep_n:]:
+            with torch.cuda.stream(self.d2h_stream):
+                for p in _iter_module_tensors(blk):
+                    if not hasattr(p, "_so_p_cpu"):
+                        # attr prefix _so_*  (stream offload) to avoid clashes
+                        p._so_p_cpu = torch.empty_like(p.data, pin_memory=True, device="cpu")
+                        p._so_orig_shape = tuple(p.shape)
+                        p._so_storage_size = p.data.untyped_storage().size()
+                        p._so_is_slice = p.data.untyped_storage().size() != p.data.numel()
+                    # copy data
+                    if p._so_is_slice:
+                        p._so_p_cpu.copy_(p.data, non_blocking=True)
+                    else:
+                        p._so_p_cpu.untyped_storage().copy_(p.data.untyped_storage(), non_blocking=True)
+            # synchronize copy before releasing storage
+            torch.cuda.current_stream().wait_stream(self.d2h_stream)
+
+        # free GPU memory
+        for blk in grp[keep_n:]:
+            for p in _iter_module_tensors(blk):
+                self._release_tensor(p)
+
+    # --------------------------------------------------------------------
     def _prefetch_hook_factory(self, tag: str):
         keep_n = self.keep_n[tag]
         grp = self.groups[tag]
 
-        def hook(module, _inputs):
-            idx = getattr(module, "_stream_offload_index") # 当前层序号
-            if idx + keep_n >= len(grp): # 尾部几层无需预取
-                return
-            nxt = grp[idx + keep_n] # 目标：窗口后一层
-            evt = torch.cuda.Event(); evt.record() # 在“当前计算流”打标记
-            with torch.cuda.stream(self.h2d_stream): # 切换到 H2D Stream
-                self.h2d_stream.wait_event(evt) # 等计算流走到 evt
-                for p in self._iter_tensors(nxt): # 逐张量
+        def _hook(m: nn.Module, _inputs):
+            idx = getattr(m, "_stream_offload_index")
+            nxt_idx = idx + keep_n
+            if nxt_idx >= len(grp):
+                return  # nothing to prefetch
+            next_blk = grp[nxt_idx]
+            event = torch.cuda.Event(); event.record()
+            assert self.h2d_stream is not None
+            with torch.cuda.stream(self.h2d_stream):
+                self.h2d_stream.wait_event(event)
+                for p in _iter_module_tensors(next_blk):
                     self._ensure_gpu_tensor(p)
-            # torch.cuda.current_stream().wait_stream(self.h2d_stream)
-        return hook
+        return _hook
 
-    # 对“滑动区”层（序号 ≥ keep_n）生效；窗口内的常驻层始终留在 GPU
+    # --------------------------------------------------------------------
     def _release_hook_factory(self, tag: str):
         keep_n = self.keep_n[tag]
-        def hook(module, _inp, _out):
-            idx = getattr(module, "_stream_offload_index")
-            if idx < keep_n: # 常驻窗口内的层不释放
-                return
-            for p in self._iter_tensors(module):
-                self._release_tensor(p) #把实际显存归还
-        return hook
+        grp = self.groups[tag]
 
-   #只对 非常驻层 做首轮 offload，把整个拷贝过程放在 d2h_stream，避免阻塞主计算流
+        def _hook(m: nn.Module, _inp, _out):
+            idx = getattr(m, "_stream_offload_index")
+            if idx < keep_n:
+                return  # resident block
+            for p in _iter_module_tensors(m):
+                self._release_tensor(p)
+        return _hook
 
-    def _setup_parameter_offload(self, grp, keep_n):
-        for idx in range(keep_n, len(grp)):
-            blk = grp[idx]
-            with torch.cuda.stream(self.d2h_stream):
-                for p in self._iter_tensors(blk):
-                    if not hasattr(p, "_stream_offload_p_cpu"):
-                        # 只保存本 rank 的 shard
-                        p._stream_offload_p_cpu = torch.empty_like(p.data, pin_memory=True, device="cpu")  #  每个张量只分配一次 pinned‑CPU 缓冲
-                        p._stream_offload_orig_shape = tuple(p.shape)
-                    p._stream_offload_p_cpu.copy_(p.data, non_blocking=True)  ## 把 GPU 数据 copy 到 CPU 缓冲，non_blocking=True，让 D2H copy 和计算重叠
-            torch.cuda.current_stream().wait_stream(self.d2h_stream) # 等复制结束
-            
-        # 立即释放 GPU storage
-        for idx in range(keep_n, len(grp)):
-            blk = grp[idx]
-            for p in self._iter_tensors(blk):
-                self._release_tensor(p) #调 _release_tensor() 把 GPU 显存真正腾出
-
-
-    #需要张量时保证它在 GPU 且可用
+    # --------------------------------------------------------------------
     def _ensure_gpu_tensor(self, p: torch.Tensor):
-        dev = self.device 
-        need_alloc = ( #  	三种情形需要重新申请 GPU storage
-            p.data.device != dev or  # a. 不在目标 GPU
-            p.data.untyped_storage().size() == 0 or # b. storage 被 resize_(0)
-            p.data.untyped_storage().size() < getattr(p, "_stream_offload_storage_size", p.numel()) # c. storage 太小
+        dev = self.device
+        need_alloc = (
+            p.data.device != dev or
+            p.data.untyped_storage().size() == 0 or
+            p.data.untyped_storage().size() < getattr(p, "_so_storage_size", p.numel())
         )
         if need_alloc:
-            target_shape = getattr(p, "_stream_offload_orig_shape", tuple(  # 取原始 shape
-                p._stream_offload_p_cpu.shape if hasattr(p, "_stream_offload_p_cpu") else p.shape)
-            )
-            p.data = torch.empty(target_shape, dtype=p.dtype, device=dev) # 重新分配到目标设备
-        # 把 CPU 缓冲 copy 回 GPU（如果有）
-        if hasattr(p, "_stream_offload_p_cpu"):
-            p.data.copy_(p._stream_offload_p_cpu, non_blocking=True)
-        else:
-            if need_alloc or p.data.device != dev:
-                p.data = p.data.to(dev, non_blocking=True)
-        #  清除“已释放”标记
-        if getattr(p, "_stream_offload_released", False):
-            p._stream_offload_released = False
+            target_shape = getattr(p, "_so_orig_shape", tuple(p.shape))
+            p.data = torch.empty(target_shape, dtype=p.dtype, device=dev)
+            if hasattr(p, "_so_storage_size"):
+                try:
+                    if p._so_storage_size != p.data.untyped_storage().size():
+                        p.data.untyped_storage().resize_(p._so_storage_size)
+                except Exception:
+                    pass  # fall back silently
+        # copy back from CPU cache if available
+        if hasattr(p, "_so_p_cpu"):
+            try:
+                p.data.copy_(p._so_p_cpu, non_blocking=True)
+            except Exception:
+                if not getattr(p, "_so_is_slice", False):
+                    try:
+                        p.data.untyped_storage().copy_(p._so_p_cpu.untyped_storage(), non_blocking=True)
+                    except Exception:
+                        pass
+        if getattr(p, "_so_released", False):
+            p._so_released = False
 
+    # --------------------------------------------------------------------
     @staticmethod
     def _release_tensor(p: torch.Tensor):
         try:
-            p.data.untyped_storage().resize_(0) #a. 先缩 storage，resize_(0) 在 C++ 侧直接归还 CUDA memory，但 保持 Tensor 对象不变 → 计算图里的引用仍安全
-            p.data.resize_(0)   #   b. 再把 shape 设为 0
-            p._stream_offload_released = True
-        except Exception: #  极端情况下退化，某些特殊 Tensor（e.g. view, tensor subclass）untyped_storage() 不支持 resize_，就用 torch.empty(0) 强行替换数据指针
+            p.data.untyped_storage().resize_(0)
+            p.data.resize_(0)
+            p._so_released = True
+        except Exception:
             p.data = torch.empty(0, dtype=p.dtype, device=p.device)
-            p._stream_offload_released = True
+            p._so_released = True
 
-    
-    #在 disable() 时调用，把所有 offload 权重完整搬回 GPU，确保模型后续还能常规使用或保存
+    # --------------------------------------------------------------------
     def _restore_all(self):
         for grp in self.groups.values():
-            for m in grp:
-                for p in self._iter_tensors(m):
-                    if hasattr(p, "_stream_offload_p_cpu"):  # 仅处理曾 offload 过的
+            for blk in grp:
+                for p in _iter_module_tensors(blk):
+                    if hasattr(p, "_so_p_cpu"):
                         if p.data.untyped_storage().size() == 0:
-                            target = torch.empty(p._stream_offload_orig_shape, dtype=p.dtype, device=self.device)
-                            target.copy_(p._stream_offload_p_cpu, non_blocking=False)
+                            target = torch.empty(p._so_orig_shape, dtype=p.dtype, device=self.device)
+                            try:
+                                if p._so_storage_size != target.untyped_storage().size():
+                                    target.untyped_storage().resize_(p._so_storage_size)
+                            except Exception:
+                                pass
+                            try:
+                                target.copy_(p._so_p_cpu, non_blocking=False)
+                            except Exception:
+                                if not p._so_is_slice:
+                                    try:
+                                        target.untyped_storage().copy_(p._so_p_cpu.untyped_storage(), non_blocking=False)
+                                    except Exception:
+                                        pass
                             p.data = target
                         elif p.data.device != self.device:
                             p.data = p.data.to(self.device, non_blocking=False)
-    #torch 的 hook 只有显式 handle.remove() 才会解绑；否则 Python 对象虽然要析构，但 C++ 端 lambda 依旧留在 Module._forward_hooks 字典里。
-    def _remove_hooks(self):
-        for h in self.handles:
-            h.remove()
-        self.handles.clear()
+
+    # ====================================================================
+    # utils
+    # ====================================================================
+
+    @staticmethod
+    def _move_module_to_device(module: nn.Module, device: torch.device):
+        if _is_fsdp(module):
+            module.to(device, non_blocking=False)
+        elif _is_ddp(module):
+            module.module.to(device, non_blocking=False)
+        else:
+            module.to(device, non_blocking=False)
+
+    # --------------------------------------------------------------------
+    def get_memory_stats(self):
+        if not torch.cuda.is_available():
+            return {"gpu_memory": "N/A"}
+        alloc = torch.cuda.memory_allocated(self.device) / 1024 ** 3
+        reserv = torch.cuda.memory_reserved(self.device) / 1024 ** 3
+        total_blks = sum(len(g) for g in self.groups.values())
+        resident_blks = sum(self.keep_n.values())
+        return {
+            "gpu_memory_allocated": f"{alloc:.2f} GB",
+            "gpu_memory_reserved": f"{reserv:.2f} GB",
+            "offload_enabled": self.enabled,
+            "total_blocks": total_blks,
+            "resident_blocks": resident_blks,
+            "offloaded_blocks": total_blks - resident_blks,
+            "keep_n": dict(self.keep_n),
+            "device": str(self.device),
+        }
+
+    # --------------------------------------------------------------------
+    def set_keep_n(self, new_keep_n: Union[int, Dict[str, int]]):
+        if isinstance(new_keep_n, int):
+            self.keep_n = {k: new_keep_n for k in self.groups}
+        else:
+            self.keep_n.update(new_keep_n)
+        if self.enabled:
+            self.logger.warning("keep_n updated but offload already enabled. Call disable() & enable() to apply.")
+
+    # --------------------------------------------------------------------
+    def is_enabled(self) -> bool:
+        return self.enabled

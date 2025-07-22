@@ -142,26 +142,23 @@ class WanVace(WanT2V):
         else:
             self.model.to(self.device)
         
-        # =================fsdp hook  model ==================
-        self._offloader = None 
-        if dist.is_initialized() and dit_fsdp:
-        # FSDP + OffloadManager
-            self._offloader = enable_fsdp_stream_offload(
-                self.model,
-                keep_n=1,                 # 可调
-                device=self.device,
-            )
-        else:
-            # 原单卡流式分配
-            offloader = OffloadManager(
-                self.model,
-                module_groups={"blocks": self.model.blocks, "vace_blocks": self.model.vace_blocks},
-                keep_n=1,
-                device=self.device,
-            )
-        offloader.enable()
-        self._offloader = offloader
-        # =================fsdp hook  model ==================
+        # ----------stream-offload setup (new API) -----------------------------------
+        is_using_fsdp = dit_fsdp and dist.is_initialized()
+
+        self.offloader = OffloadManager(
+            root=self.model,
+            device=self.device,
+            distributed=is_using_fsdp,
+        )
+        self.offloader.register_modules(
+            "blocks", self.model.blocks, resident_count=1
+        )
+        self.offloader.register_modules(
+            "vace_blocks", self.model.vace_blocks, resident_count=1
+        )
+        self.offloader.enable()
+
+        # ------------------------------------------------------------------
         
 
         self.sample_neg_prompt = config.sample_neg_prompt
