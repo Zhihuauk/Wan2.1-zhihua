@@ -471,7 +471,10 @@ class WanVace(WanT2V):
 
                 timestep = torch.stack(timestep)
 
-                self.model.to(self.device)
+                # 避免在FSDP + Offload环境下不必要的设备移动
+                # FSDP模块已经在正确设备上，额外的to()调用会与stream offload冲突
+                if not (self.offloader.distributed and self.offloader.is_enabled()):
+                    self.model.to(self.device)
                 noise_pred_cond = self.model(
                     latent_model_input,
                     t=timestep,
